@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -278,8 +278,33 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        match self.state.read().memtable.get(key) {
+            Some(data) => {
+                if data.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(data))
+                }
+            }
+            None => {
+                // read from imm_memtables if not exist in memtable
+                let guard = self.state.read();
+                for memtable in guard.imm_memtables.iter() {
+                    match memtable.get(key) {
+                        Some(data) => {
+                            return if data.is_empty() {
+                                Ok(None)
+                            } else {
+                                Ok(Some(data))
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +313,42 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        assert!(!key.is_empty(), "key cannot be empty");
+        assert!(!value.is_empty(), "value cannot be empty");
+
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, value)?;
+            size = guard.memtable.approximate_size();
+        }
+        if size >= self.options.target_sst_size {
+            let guard = self.state_lock.lock();
+            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&guard)?
+            }
+        }
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        assert!(!key.is_empty(), "key cannot be empty");
+
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, &[])?;
+            size = guard.memtable.approximate_size();
+        }
+        if size >= self.options.target_sst_size {
+            let guard = self.state_lock.lock();
+            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&guard)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +373,15 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            let old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+            snapshot.imm_memtables.insert(0, old_memtable);
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -339,5 +401,52 @@ impl LsmStorageInner {
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, RwLock};
+    use std::thread;
+
+    #[derive(Debug, PartialEq)]
+    struct SharedData {
+        value: i32,
+    }
+
+    #[test]
+    fn test_rwlock_operations() {
+        // 创建一个共享数据结构，并用 RwLock 保护它
+        let shared_data = Arc::new(RwLock::new(SharedData { value: 0 }));
+
+        // 创建多个线程来测试读取和写入操作
+        let mut handles = vec![];
+
+        // 创建一个写入线程
+        let writer_shared_data = Arc::clone(&shared_data);
+        let writer_handle = thread::spawn(move || {
+            let mut data = writer_shared_data.write().unwrap();
+            data.value += 1;
+            assert_eq!(data.value, 1);
+        });
+        handles.push(writer_handle);
+
+        // 创建多个读取线程
+        for _ in 0..5 {
+            let reader_shared_data = Arc::clone(&shared_data);
+            let reader_handle = thread::spawn(move || {
+                let data = reader_shared_data.read().unwrap();
+            });
+            handles.push(reader_handle);
+        }
+
+        // 等待所有线程完成
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // 最后再读取一次数据，确保写入操作已经完成
+        let final_data = shared_data.read().unwrap();
+        assert_eq!(final_data.value, 1);
     }
 }
