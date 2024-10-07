@@ -77,6 +77,10 @@ impl Key<Vec<u8>> {
 }
 
 impl Key<Bytes> {
+    pub fn new() -> Self {
+        Self(Bytes::new())
+    }
+
     pub fn as_key_slice(&self) -> KeySlice {
         Key(&self.0)
     }
